@@ -60,6 +60,28 @@ function removalCommand(dir, isWin) {
   return 'rm -rf -- ' + shSingle(dir);
 }
 
+/**
+ * 跑一条命令并取回前台结果。
+ *
+ * DSH 0.1.7-rc.2 起 `ctx.shell` 的执行入口由 `run(spec)` 改名为 `execute(spec)`，
+ * 且返回的是 `ShellExecution` 句柄——真正的 `ShellRunResult`（`exitCode` /
+ * `sandbox.denied` / `stderr`）要再经 `result()` 才能拿到；0.1.0-rc.6 则是
+ * `run(spec)` 直接给结果。两种都支持，否则新版上 `deps.shell.run` 不存在，
+ * 抛 TypeError 被记成 `run-error`，删除一律返回 500。
+ *
+ * @param deps - 插件依赖集合（含 `shell`）
+ * @param request - `ShellExecRequest`
+ * @returns `ShellRunResult` 或旧版等价结果
+ */
+async function runShell(deps, request) {
+  const spec = await deps.shell.resolve(request);
+  if (typeof deps.shell.execute === 'function') {
+    const execution = await deps.shell.execute(spec);
+    return typeof execution?.result === 'function' ? await execution.result() : execution;
+  }
+  return deps.shell.run(spec);
+}
+
 /** 收集并解析 JSON 请求体；空体返回 {}，非法 JSON 返回 null。 */
 async function readJsonBody(req) {
   const chunks = [];
@@ -135,10 +157,32 @@ function removeBackup(id) {
 
 /* ---------------- 会话/工作区查找 ---------------- */
 
+/**
+ * 从 `sessionPersistence.list()` 的一项里取出 Session header。
+ *
+ * DSH 0.1.7-rc.2 起 `list()` 返回 `SessionPersistenceSnapshot`，即
+ * `{ header, revision, eventCount?, sizeBytes? }`，会话 id 与 cwd 都在 `header` 里；
+ * 0.1.0-rc.6 及更早返回的是扁平的 header 本身。两种都认，否则在新版 DSH 上
+ * 每一个会话都会因 `id` 取不到而落到 missing 分支——删除、归档、恢复全部失效。
+ *
+ * @param snapshot - `list()` 返回的一项
+ * @returns 该项的 header，或 undefined（结构无法识别时）
+ */
+function headerOf(snapshot) {
+  if (snapshot === null || snapshot === undefined) return undefined;
+  if (snapshot.header !== null && typeof snapshot.header === 'object') return snapshot.header;
+  return typeof snapshot.id === 'string' ? snapshot : undefined;
+}
+
 async function findHeader(deps, id) {
   try {
-    const headers = await deps.persistence.list();
-    return Array.isArray(headers) ? headers.find((h) => h && h.id === id) : undefined;
+    const snapshots = await deps.persistence.list();
+    if (!Array.isArray(snapshots)) return undefined;
+    for (const snapshot of snapshots) {
+      const header = headerOf(snapshot);
+      if (header !== undefined && header.id === id) return header;
+    }
+    return undefined;
   } catch (e) {
     log('list headers failed', e);
     return undefined;
@@ -170,6 +214,31 @@ function backupWorkspace(deps, id, header) {
 }
 
 /* ---------------- 删除 ---------------- */
+
+/**
+ * 某个工作区应覆盖的全部会话：工作区账目里的，加上日志落在同一项目目录下
+ * 但没有登记进任何工作区的会话（子代理会话、被 detach 的会话）。
+ * 只走 `w.sessionIds` 会漏掉后者——它们不在侧栏，任何 GUI 删除都碰不到，
+ * 而 DSH 持久层没有删除接口，这些日志会一直留在磁盘上。
+ */
+async function sessionIdsForWorkspace(deps, w) {
+  const ids = new Set([...w.sessionIds].map(String));
+  const target = canonicalPath(w.path);
+  let snapshots;
+  try {
+    snapshots = await deps.persistence.list();
+  } catch (e) {
+    log('list headers failed', e);
+    snapshots = [];
+  }
+  for (const snapshot of Array.isArray(snapshots) ? snapshots : []) {
+    const h = headerOf(snapshot);
+    if (h === undefined) continue;
+    if (typeof h.id !== 'string' || h.id === '' || typeof h.cwd !== 'string' || h.cwd === '') continue;
+    if (canonicalPath(h.cwd) === target) ids.add(h.id);
+  }
+  return [...ids];
+}
 
 /**
  * 删除一个会话：live 拒绝 → 定位日志 → 沙箱 rm 目录 → 归档 + detach 簿记。
@@ -204,19 +273,18 @@ async function deleteOne(deps, id, report) {
   /* 1) 先删文件：受限沙箱（root=该项目目录）。失败则无任何状态变化。 */
   let res;
   try {
-    const spec = await deps.shell.resolve({
+    res = await runShell(deps, {
       command: removalCommand(dir, loc.path.indexOf('\\') !== -1),
       timeoutMs: 30_000,
       sandboxPolicy: { mode: 'workspace-write', workspaceRoot: parent },
     });
-    res = await deps.shell.run(spec);
   } catch (e) {
     report.failed.push({ id, code: 'run-error', detail: textOf(e && e.message) });
     return;
   }
-  const denied = res.sandbox !== undefined && res.sandbox.denied === true;
-  if (res.exitCode !== 0) {
-    report.failed.push({ id, code: denied ? 'sandbox-denied' : 'rm-failed', detail: textOf(res.stderr) });
+  const denied = res?.sandbox !== undefined && res.sandbox.denied === true;
+  if (res?.exitCode !== 0) {
+    report.failed.push({ id, code: denied ? 'sandbox-denied' : 'rm-failed', detail: textOf(res?.stderr) });
     return;
   }
   /* 2) 文件已删，做簿记：归档隐藏 + 工作区账目 detach。失败仅影响显示。 */
@@ -354,9 +422,12 @@ async function restoreMany(deps, ids, report) {
 async function listArchived(deps) {
   const reg = deps.registry;
   const ids = [...reg.archivedSessionIds].map(String);
-  const headers = await deps.persistence.list();
+  const snapshots = await deps.persistence.list();
   const byId = new Map();
-  for (const h of Array.isArray(headers) ? headers : []) byId.set(String(h.id), h);
+  for (const snapshot of Array.isArray(snapshots) ? snapshots : []) {
+    const h = headerOf(snapshot);
+    if (h !== undefined && typeof h.id === 'string') byId.set(h.id, h);
+  }
   const backups = loadBackups();
 
   let titles = new Map();
@@ -439,9 +510,11 @@ export default {
             return;
           }
           const report = { deleted: [], live: [], missing: [], failed: [] };
-          for (const id of [...w.sessionIds]) await deleteOne(deps, id, report);
+          const ids = await sessionIdsForWorkspace(deps, w);
+          for (const id of ids) await deleteOne(deps, id, report);
           sendJson(res, 200, {
             ok: true,
+            scanned: ids.length,
             deleted: report.deleted.length,
             live: report.live.length,
             missing: report.missing.length,

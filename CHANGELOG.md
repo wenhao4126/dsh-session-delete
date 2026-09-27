@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- 修复“删除全部会话”只遍历工作区账目的问题：现在按项目目录枚举全部会话，覆盖未登记进工作区的子代理会话与已脱钩会话。
+- `POST /dsh-session-delete/delete-all` 响应新增 `scanned` 字段，返回本次实际扫描到的会话数。
+
 ## 0.3.1 - 2026-08-29
 
 - 修复从 `node:fs` 错误导入 `dirname` 导致 dsh web 启动失败的问题。
